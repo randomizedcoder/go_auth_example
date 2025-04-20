@@ -105,24 +105,21 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	authpb "github.com/your/module/proto"
+	"github.com/nats-io/nats.go"
 	"google.golang.org/grpc"
 )
 
-// In-memory challenge store (in production use a DB or cache)
 var (
-	challenges   = make(map[string][]byte)
-	challengesMu sync.Mutex
-
 	// Replace this with actual lookup per user
 	knownPublicKeys = map[string]ed25519.PublicKey{}
 )
 
 type server struct {
 	authpb.UnimplementedAuthServiceServer
+	kv nats.KeyValue
 }
 
 func (s *server) GetChallenge(ctx context.Context, req *authpb.ChallengeRequest) (*authpb.ChallengeResponse, error) {
@@ -131,18 +128,26 @@ func (s *server) GetChallenge(ctx context.Context, req *authpb.ChallengeRequest)
 	if err != nil {
 		return nil, err
 	}
-	challengesMu.Lock()
-	challenges[req.Username] = challenge
-	challengesMu.Unlock()
+	// Store the challenge in NATS KV with a TTL of 120 seconds
+	err = s.kv.PutString(req.Username, base64.StdEncoding.EncodeToString(challenge))
+	if err != nil {
+		return nil, err
+	}
+	s.kv.Watch(req.Username)
+	s.kv.Update(req.Username, []byte(base64.StdEncoding.EncodeToString(challenge)))
+	s.kv.Create(req.Username, []byte(base64.StdEncoding.EncodeToString(challenge)))
+
 	return &authpb.ChallengeResponse{Challenge: challenge}, nil
 }
 
 func (s *server) Authenticate(ctx context.Context, req *authpb.AuthRequest) (*authpb.AuthResponse, error) {
-	challengesMu.Lock()
-	challenge, ok := challenges[req.Username]
-	challengesMu.Unlock()
-	if !ok {
+	entry, err := s.kv.Get(req.Username)
+	if err != nil {
 		return &authpb.AuthResponse{Success: false, Message: "no challenge issued"}, nil
+	}
+	challenge, err := base64.StdEncoding.DecodeString(string(entry.Value()))
+	if err != nil {
+		return &authpb.AuthResponse{Success: false, Message: "invalid challenge encoding"}, nil
 	}
 
 	pubKey, ok := knownPublicKeys[req.Username]
@@ -154,15 +159,30 @@ func (s *server) Authenticate(ctx context.Context, req *authpb.AuthRequest) (*au
 		return &authpb.AuthResponse{Success: false, Message: "invalid signature"}, nil
 	}
 
-	// Optional: delete challenge after use
-	challengesMu.Lock()
-	delete(challenges, req.Username)
-	challengesMu.Unlock()
+	s.kv.Delete(req.Username)
 
 	return &authpb.AuthResponse{Success: true, Message: "authenticated"}, nil
 }
 
 func main() {
+	// Connect to NATS
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		log.Fatalf("failed to connect to NATS: %v", err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		log.Fatalf("failed to get JetStream context: %v", err)
+	}
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:      "xtcp_auth_challenges",
+		TTL:         120 * time.Second,
+		MaxValueSize: 512,
+	})
+	if err != nil {
+		log.Fatalf("failed to create KV bucket: %v", err)
+	}
+
 	// Generate dummy keypair for demo
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	knownPublicKeys["alice"] = pub
@@ -172,7 +192,7 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	grpcServer := grpc.NewServer()
-	authpb.RegisterAuthServiceServer(grpcServer, &server{})
+	authpb.RegisterAuthServiceServer(grpcServer, &server{kv: kv})
 	fmt.Println("gRPC auth server listening on :50051")
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
