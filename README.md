@@ -199,3 +199,37 @@ func main() {
 	}
 }
 ```
+
+```
+import (
+    "context"
+    "google.golang.org/grpc/metadata"
+)
+
+md := metadata.New(map[string]string{
+    "x-username": "alice",
+    "x-signature": base64.StdEncoding.EncodeToString(sig),
+})
+
+ctx := metadata.NewOutgoingContext(context.Background(), md)
+resp, err := client.Authenticate(ctx, &authpb.AuthRequest{Challenge: challenge})
+```
+
+```
+import (
+    "google.golang.org/grpc/metadata"
+)
+
+func (s *server) Authenticate(ctx context.Context, req *authpb.AuthRequest) (*authpb.AuthResponse, error) {
+    md, ok := metadata.FromIncomingContext(ctx)
+    if !ok {
+        return nil, errors.New("missing metadata")
+    }
+
+    username := md.Get("x-username")
+    sigB64 := md.Get("x-signature")
+
+    // decode, verify, etc...
+}
+
+```
